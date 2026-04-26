@@ -7,7 +7,6 @@ class UserController (Controller) {
     }
 
     fn index(req, res) async {
-        println(this.services.db);
         res.status(200).json({ message: "Hello" });
     }
 
