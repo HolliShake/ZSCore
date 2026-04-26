@@ -1,0 +1,428 @@
+import { args, system          } from "core:os";
+import { exists, absolutePath, join                } from "core:path";
+import { Date                  } from "core:date";
+import { File, println, print, setColor, format } from "core:io";
+import { byteLength, replace, toLower, toUpper, endsWith, split, chr, codepoints } from "core:string";
+import { createArgParser       } from "lib:argparser";
+import { MigrationRunner       } from "./core/migration";
+import { DB                    } from "./db/dbcontext";
+
+const ScriptPath      = absolutePath(__dir);
+const ModelsPath      = join(ScriptPath, "models");
+const SeedersPath     = join(ScriptPath, "seeders");
+const MigrationsPath  = join(ScriptPath, "migrations");
+const ControllersPath = join(ScriptPath, "controllers");
+
+println(ScriptPath);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  yelle — tinylms development CLI  (like Laravel Artisan)
+//
+//  Usage:
+//    zscript --run ./backend/yelle [flags]
+//
+//  Multiple flags may be combined in one call:
+//    zscript --run ./backend/yelle --create-model Post --create-controller Post --add-migration create_posts_table
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BANNER =
+    "\n  =========================================\n" +
+    "      yelle  v1.0.0  —  tinylms toolkit\n"    +
+    "  =========================================\n";
+
+// ── Output helpers ────────────────────────────────────────────────────────────
+
+fn printOk(msg)   { setColor(32); print("  [OK]   "); setColor(); println(msg); }
+fn printInfo(msg) { setColor(36); print("  [INFO] "); setColor(); println(msg); }
+fn printErr(msg)  { setColor(31); print("  [ERR]  "); setColor(); println(msg); }
+fn printWarn(msg) { setColor(33); print("  [WARN] "); setColor(); println(msg); }
+
+// ── String helpers ────────────────────────────────────────────────────────────
+
+// First character of a string (returns "" for empty string).
+fn strHead(s) {
+    local cp = codepoints(s);
+    if (cp.length() == 0) return "";
+    return chr(cp[0]);
+}
+
+// Everything after the first character (returns "" for empty / single-char).
+fn strTail(s) {
+    local cp  = codepoints(s);
+    local out = "";
+    local i   = 1;
+    while (i < cp.length()) {
+        out = out + chr(cp[i]);
+        i   = i + 1;
+    }
+    return out;
+}
+
+// "create_posts_table" or "create-posts-table" → "CreatePostsTable"
+// "post"              or "Post"               → "Post"
+fn toPascalCase(name) {
+    local normalized = replace(toLower(name), "-", "_");
+    local parts      = split(normalized, "_");
+    local result     = "";
+    local i          = 0;
+    while (i < parts.length()) {
+        local part = parts[i];
+        if (byteLength(part) > 0) {
+            result = result + toUpper(strHead(part)) + strTail(part);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// "Post" or "post" → "post"  (used for file names)
+fn toSlug(name) {
+    return toLower(name);
+}
+
+// Naive pluralisation: append "s" unless the name already ends with one.
+fn toTableName(name) {
+    local s = toLower(name);
+    if (endsWith(s, "s")) return s;
+    return s + "s";
+}
+
+// ── Flag helpers ──────────────────────────────────────────────────────────────
+
+fn getFlag(r, key) {
+    return r.flags[key];
+}
+
+fn resolveSteps(r) {
+    local raw = getFlag(r, "steps");
+    if (raw == null) return 1;
+    local n = 0 + raw;
+    if (n < 1) return 1;
+    return n;
+}
+
+// ── File-system helpers ───────────────────────────────────────────────────────
+
+// Write text content to a file path (creates or overwrites).
+fn writeFile(path, content) {
+    local f = new File(path, "w");
+    f.write(content);
+    f.close();
+}
+
+// Create a directory (and parents) if it does not already exist.
+fn ensureDir(path) {
+    if (!exists(path)) {
+        system("mkdir -p " + path);
+        printInfo("Created directory: " + path);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Scaffold generators
+//  All paths are relative to CWD (project root); run as:
+//    zscript --run ./backend/yelle
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn scaffoldMigration(name) {
+    local className = toPascalCase(name);
+    local slug      = toSlug(name);
+    local ts        = (new Date()).getTime();
+    local dir       = "./backend/migrations";
+    local filename  = ts + "_" + slug + ".zs";
+    local filepath  = dir + "/" + filename;
+
+    ensureDir(dir);
+
+    if (exists(filepath)) {
+        printWarn("Migration already exists: " + filepath);
+        return;
+    }
+
+    local content =
+        "import { Migration } from \"../core/migration\";\n"      +
+        "\n"                                                       +
+        "class " + className + " (Migration) {\n"                 +
+        "    fn init() { base(this); }\n"                         +
+        "\n"                                                       +
+        "    fn up(schema) {\n"                                    +
+        "        schema.create(\"" + slug + "\", fn(t) {\n"       +
+        "            t.id();\n"                                    +
+        "            t.timestamps();\n"                           +
+        "        });\n"                                            +
+        "    }\n"                                                  +
+        "\n"                                                       +
+        "    fn down(schema) {\n"                                  +
+        "        schema.drop(\"" + slug + "\");\n"                +
+        "    }\n"                                                  +
+        "}\n";
+
+    writeFile(filepath, content);
+    printOk("Migration created: " + filepath);
+    printInfo("  Class: " + className);
+    printInfo("  Register in AppDbContext._migrations = [ new " + className + "(), ... ]");
+}
+
+fn scaffoldModel(name) {
+    local className = toPascalCase(name);
+    local slug      = toSlug(name);
+    local filepath  = "./backend/model/" + slug + ".zs";
+
+    if (exists(filepath)) {
+        printWarn("Model already exists: " + filepath);
+        return;
+    }
+
+    local tableName = toTableName(slug);
+
+    local content =
+        "import { Model } from \"../core/base\";\n"                      +
+        "\n"                                                              +
+        "class " + className + " (Model) {\n"                            +
+        "    fn init() {\n"                                               +
+        "        base(this);\n"                                           +
+        "        this._table    = \"" + tableName + "\";\n"              +
+        "        this._fillable = [];\n"                                  +
+        "        this._hidden   = [];\n"                                  +
+        "        this._casts    = {};\n"                                  +
+        "    }\n"                                                         +
+        "}\n";
+
+    writeFile(filepath, content);
+    printOk("Model created: " + filepath);
+    printInfo("  Class: " + className + "   table: " + tableName);
+    printInfo("  Add to AppDbContext:  this." + slug + "s = new " + className + "();");
+}
+
+fn scaffoldController(name) {
+    local baseName  = toPascalCase(name);
+    local className = baseName + "Controller";
+    local slug      = toSlug(name);
+    local filepath  = "./backend/controllers/" + slug + ".zs";
+
+    if (exists(filepath)) {
+        printWarn("Controller already exists: " + filepath);
+        return;
+    }
+
+    local content =
+        "import { Controller } from \"../core/controller\";\n"         +
+        "\n"                                                            +
+        "class " + className + " (Controller) {\n"                     +
+        "    fn init() { base(this); }\n"                              +
+        "\n"                                                            +
+        "    // GET /" + slug + "\n"                                    +
+        "    fn index(req, res) async {\n"                              +
+        "        res.status(200).json({ message: \"ok\" });\n"         +
+        "    }\n"                                                       +
+        "\n"                                                            +
+        "    // GET /" + slug + "/:id\n"                               +
+        "    fn show(req, res) async {\n"                               +
+        "        const id = req.params[\"0\"];\n"                      +
+        "        res.status(200).json({ id: id });\n"                  +
+        "    }\n"                                                       +
+        "\n"                                                            +
+        "    // POST /" + slug + "\n"                                   +
+        "    fn store(req, res) async {\n"                              +
+        "        res.status(201).json({ message: \"created\" });\n"    +
+        "    }\n"                                                       +
+        "\n"                                                            +
+        "    // PUT /" + slug + "/:id\n"                                +
+        "    fn update(req, res) async {\n"                             +
+        "        const id = req.params[\"0\"];\n"                      +
+        "        res.status(200).json({ id: id });\n"                  +
+        "    }\n"                                                       +
+        "\n"                                                            +
+        "    // DELETE /" + slug + "/:id\n"                             +
+        "    fn destroy(req, res) async {\n"                            +
+        "        res.status(204).send();\n"                             +
+        "    }\n"                                                       +
+        "}\n";
+
+    writeFile(filepath, content);
+    printOk("Controller created: " + filepath);
+    printInfo("  Class: " + className);
+    printInfo("  Register in main.zs:");
+    printInfo("    import { " + className + " } from \"./controllers/" + slug + "\";");
+    printInfo("    APP.controller(" + className + ", fn(app) { ... });");
+}
+
+fn scaffoldMiddleware(name) {
+    local fnName   = toPascalCase(name) + "Middleware";
+    local slug     = toSlug(name);
+    local dir      = "./backend/middleware";
+    local filepath = dir + "/" + slug + ".zs";
+
+    ensureDir(dir);
+
+    if (exists(filepath)) {
+        printWarn("Middleware already exists: " + filepath);
+        return;
+    }
+
+    local content =
+        "import { println } from \"core:io\";\n"                            +
+        "\n"                                                                 +
+        "fn " + fnName + "(req, res) async {\n"                             +
+        "    // TODO: implement " + fnName + " logic\n"                      +
+        "    // Return early on failure: res.status(401).json({ ... });\n"  +
+        "}\n";
+
+    writeFile(filepath, content);
+    printOk("Middleware created: " + filepath);
+    printInfo("  Function: " + fnName);
+    printInfo("  Register in main.zs:");
+    printInfo("    import { " + fnName + " } from \"./middleware/" + slug + "\";");
+    printInfo("    APP.use(" + fnName + ");");
+}
+
+fn scaffoldSeeder(name) {
+    local className = toPascalCase(name) + "Seeder";
+    local slug      = toSlug(name);
+    local dir       = "./backend/seeders";
+    local filepath  = dir + "/" + slug + ".zs";
+
+    ensureDir(dir);
+
+    if (exists(filepath)) {
+        printWarn("Seeder already exists: " + filepath);
+        return;
+    }
+
+    local content =
+        "import { println } from \"core:io\";\n"                    +
+        "import { DB } from \"../db/dbcontext\";\n"                 +
+        "\n"                                                         +
+        "fn run" + className + "() async {\n"                       +
+        "    // TODO: seed your database records here\n"            +
+        "    // await DB.tableName.create({ ... });\n"              +
+        "    println(\"" + className + " finished.\");\n"           +
+        "}\n"                                                        +
+        "\n"                                                         +
+        "run" + className + "();\n";
+
+    writeFile(filepath, content);
+    printOk("Seeder created: " + filepath);
+    printInfo("  Run with: zscript --run ./backend/seeders/" + slug + ".zs");
+}
+
+// ── ArgParser setup ───────────────────────────────────────────────────────────
+
+const p = createArgParser();
+
+// Server
+p.option({ long: "serve",             short: "S", help: "Start the development server (runs main.zs)" });
+
+// Migrations
+p.option({ long: "migrate",           short: "m", help: "Run all pending migrations" });
+p.option({ long: "rollback",          short: "r", help: "Roll back the last batch" });
+p.option({ long: "fresh",             short: "F", help: "Drop all tables and re-run all migrations" });
+p.option({ long: "status",                        help: "Show migration status table" });
+p.option({ long: "steps",             short: "s", takesValue: true, help: "Batches to rollback (default: 1)" });
+
+// Scaffolding
+p.option({ long: "add-migration",                 takesValue: true, help: "Scaffold a new migration      <name>" });
+p.option({ long: "create-model",                  takesValue: true, help: "Scaffold a new model           <name>" });
+p.option({ long: "create-controller",             takesValue: true, help: "Scaffold a new controller      <name>" });
+p.option({ long: "create-middleware",             takesValue: true, help: "Scaffold a new middleware      <name>" });
+p.option({ long: "create-seeder",                 takesValue: true, help: "Scaffold a new database seeder <name>" });
+
+// Help
+p.option({ long: "help",              short: "h", help: "Show this help message" });
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() async {
+    const r = p.parse(args());
+
+    if (r.flags["help"] || r.flags["h"]) {
+        println(BANNER);
+        println(p.helpText("yelle"));
+        return;
+    }
+
+    if (!r.ok) {
+        local i = 0;
+        while (i < r.errors.length()) {
+            printErr(r.errors[i]);
+            i = i + 1;
+        }
+        println();
+        println(p.helpText("yelle"));
+        return;
+    }
+
+    local anyFlag = false;
+
+    // ── Scaffolding (runs before serve so output is always visible) ───────────
+
+    if (getFlag(r, "add-migration") != null) {
+        anyFlag = true;
+        scaffoldMigration(getFlag(r, "add-migration"));
+    }
+
+    if (getFlag(r, "create-model") != null) {
+        anyFlag = true;
+        scaffoldModel(getFlag(r, "create-model"));
+    }
+
+    if (getFlag(r, "create-controller") != null) {
+        anyFlag = true;
+        scaffoldController(getFlag(r, "create-controller"));
+    }
+
+    if (getFlag(r, "create-middleware") != null) {
+        anyFlag = true;
+        scaffoldMiddleware(getFlag(r, "create-middleware"));
+    }
+
+    if (getFlag(r, "create-seeder") != null) {
+        anyFlag = true;
+        scaffoldSeeder(getFlag(r, "create-seeder"));
+    }
+
+    // ── Migration commands ────────────────────────────────────────────────────
+
+    if (r.flags["migrate"] || r.flags["m"]) {
+        anyFlag = true;
+        const runner = new MigrationRunner(DB);
+        await runner.migrate(DB._migrations);
+    }
+
+    if (r.flags["rollback"] || r.flags["r"]) {
+        anyFlag = true;
+        const runner = new MigrationRunner(DB);
+        await runner.rollback(DB._migrations, resolveSteps(r));
+    }
+
+    if (r.flags["fresh"] || r.flags["F"]) {
+        anyFlag = true;
+        const runner = new MigrationRunner(DB);
+        await runner.fresh(DB._migrations);
+    }
+
+    if (r.flags["status"]) {
+        anyFlag = true;
+        const runner = new MigrationRunner(DB);
+        await runner.status(DB._migrations);
+    }
+
+    // ── --serve (runs last — blocks until server exits) ───────────────────────
+
+    if (r.flags["serve"] || r.flags["S"]) {
+        anyFlag = true;
+        println(BANNER);
+        printInfo("Starting development server...");
+        println();
+        system("zscript --run ./backend/main.zs");
+    }
+
+    // ── No flags → print help ─────────────────────────────────────────────────
+
+    if (!anyFlag) {
+        println(BANNER);
+        println(p.helpText("yelle"));
+    }
+}
+
+main();
