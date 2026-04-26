@@ -12,8 +12,8 @@ const ModelsPath      = join(ScriptPath, "models");
 const SeedersPath     = join(ScriptPath, "seeders");
 const MigrationsPath  = join(ScriptPath, "migrations");
 const ControllersPath = join(ScriptPath, "controllers");
-
-println(ScriptPath);
+const MiddlewarePath  = join(ScriptPath, "middleware");
+const TablesPath      = join(join(ScriptPath, "db"), "tables.zs");
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  yelle — tinylms development CLI  (like Laravel Artisan)
@@ -118,6 +118,67 @@ fn ensureDir(path) {
     }
 }
 
+// Append a model class to db/tables.zs (import + TABLES entry).
+fn updateTablesFile(className, slug) {
+    local f       = new File(TablesPath, "r");
+    local content = f.read();
+    f.close();
+
+    local lines         = split(content, "\n");
+    local lastImportIdx = -1;
+    local closingIdx    = -1;
+    local i             = 0;
+    while (i < lines.length()) {
+        local line = lines[i];
+        local cp   = codepoints(line);
+        if (cp.length() >= 6) {
+            if (chr(cp[0]) == "i" && chr(cp[1]) == "m" && chr(cp[2]) == "p" &&
+                chr(cp[3]) == "o" && chr(cp[4]) == "r" && chr(cp[5]) == "t") {
+                lastImportIdx = i;
+            }
+        }
+        if (endsWith(line, "];")) {
+            closingIdx = i;
+        }
+        i = i + 1;
+    }
+
+    // Find the last non-blank line inside the array to append a comma if missing.
+    local prevContentIdx = closingIdx - 1;
+    while (prevContentIdx > 0 && byteLength(replace(lines[prevContentIdx], " ", "")) == 0) {
+        prevContentIdx = prevContentIdx - 1;
+    }
+
+    local modelDir  = replace(ModelsPath, ScriptPath, "..");
+    local newImport = "import { " + className + " } from \"" + modelDir + "/" + slug + "\";";
+    // New entry has no trailing comma — ZScript forbids trailing commas in arrays.
+    // The previous last entry gains a comma to separate it from the new one.
+    local newEntry = "    " + className;
+    local result   = "";
+    local j        = 0;
+    while (j < lines.length()) {
+        local line = lines[j];
+        // Before `];`, inject the new entry (no trailing comma)
+        if (j == closingIdx) {
+            result = result + newEntry + "\n";
+        }
+        // Add comma to previous last entry (separator, not trailing comma)
+        if (j == prevContentIdx && byteLength(replace(line, " ", "")) > 0 && !endsWith(line, ",")) {
+            result = result + line + "," + "\n";
+        } else {
+            result = result + line + "\n";
+        }
+        // After the last import, inject the new import
+        if (j == lastImportIdx) {
+            result = result + newImport + "\n";
+        }
+        j = j + 1;
+    }
+
+    writeFile(TablesPath, result);
+    printInfo("  Updated db/tables.zs → added " + className);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Scaffold generators
 //  All paths are relative to CWD (project root); run as:
@@ -128,9 +189,9 @@ fn scaffoldMigration(name) {
     local className = toPascalCase(name);
     local slug      = toSlug(name);
     local ts        = (new Date()).getTime();
-    local dir       = "./backend/migrations";
+    local dir       = MigrationsPath;
     local filename  = ts + "_" + slug + ".zs";
-    local filepath  = dir + "/" + filename;
+    local filepath  = join(dir, filename);
 
     ensureDir(dir);
 
@@ -166,7 +227,7 @@ fn scaffoldMigration(name) {
 fn scaffoldModel(name) {
     local className = toPascalCase(name);
     local slug      = toSlug(name);
-    local filepath  = "./backend/model/" + slug + ".zs";
+    local filepath  = join(ModelsPath, slug + ".zs");
 
     if (exists(filepath)) {
         printWarn("Model already exists: " + filepath);
@@ -192,13 +253,14 @@ fn scaffoldModel(name) {
     printOk("Model created: " + filepath);
     printInfo("  Class: " + className + "   table: " + tableName);
     printInfo("  Add to AppDbContext:  this." + slug + "s = new " + className + "();");
+    updateTablesFile(className, slug);
 }
 
 fn scaffoldController(name) {
     local baseName  = toPascalCase(name);
     local className = baseName + "Controller";
     local slug      = toSlug(name);
-    local filepath  = "./backend/controllers/" + slug + ".zs";
+    local filepath  = join(ControllersPath, slug + ".zs");
 
     if (exists(filepath)) {
         printWarn("Controller already exists: " + filepath);
@@ -250,8 +312,8 @@ fn scaffoldController(name) {
 fn scaffoldMiddleware(name) {
     local fnName   = toPascalCase(name) + "Middleware";
     local slug     = toSlug(name);
-    local dir      = "./backend/middleware";
-    local filepath = dir + "/" + slug + ".zs";
+    local dir      = MiddlewarePath;
+    local filepath = join(dir, slug + ".zs");
 
     ensureDir(dir);
 
@@ -279,8 +341,8 @@ fn scaffoldMiddleware(name) {
 fn scaffoldSeeder(name) {
     local className = toPascalCase(name) + "Seeder";
     local slug      = toSlug(name);
-    local dir       = "./backend/seeders";
-    local filepath  = dir + "/" + slug + ".zs";
+    local dir       = SeedersPath;
+    local filepath  = join(dir, slug + ".zs");
 
     ensureDir(dir);
 
@@ -414,7 +476,7 @@ fn main() async {
         println(BANNER);
         printInfo("Starting development server...");
         println();
-        system("zscript --run ./backend/main.zs");
+        system("zscript --run " + join(ScriptPath, "main.zs"));
     }
 
     // ── No flags → print help ─────────────────────────────────────────────────
